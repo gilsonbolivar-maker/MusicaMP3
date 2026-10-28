@@ -1,5 +1,5 @@
 // Cache do "esqueleto" do app para abrir offline.
-const CACHE = 'musicamp3-v1';
+const CACHE = 'musicamp3-v2';
 const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'manifest.webmanifest', 'icons/icon.svg', 'icons/icon-192.png', 'icons/icon-512.png'];
 
 self.addEventListener('install', (e) => {
