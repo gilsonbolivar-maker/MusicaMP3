@@ -18,6 +18,7 @@
     <section id="view-search" class="view active" aria-label="Baixar">
       <nav class="tabs" role="tablist">
         <button class="tab active" data-source="all" role="tab">Pesquisar</button>
+        <button class="tab" data-source="youtube" role="tab">YouTube</button>
         <button class="tab" data-source="archive" role="tab">Archive</button>
         <button class="tab" data-source="jamendo" role="tab">Jamendo</button>
       </nav>
@@ -42,9 +43,36 @@
           <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>
         </button>
       </form>
-      <p class="hint" id="hint">Músicas com licença livre do <b>Internet Archive</b> e do <b>Jamendo</b>.</p>
+      <p class="hint" id="hint">Toque no <b>YouTube</b> e baixe músicas livres do <b>Internet Archive</b> e do <b>Jamendo</b>.</p>
+      <button id="open-list" class="btn list-btn" type="button">
+        <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>
+        Colar lista de músicas
+      </button>
 
       <div id="results" class="results" aria-live="polite"></div>
+    </section>
+
+    <!-- Lista de músicas -->
+    <section id="view-list" class="view" aria-label="Lista de músicas">
+      <header class="view-head">
+        <button id="list-back" class="icon-btn" aria-label="Voltar">
+          <svg class="ico" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></svg>
+        </button>
+        <h2 class="grow">Lista de músicas</h2>
+      </header>
+      <p class="small">Cole uma música por linha, no formato <b>Artista - Música</b>. O app procura primeiro na sua biblioteca e depois no YouTube.</p>
+      <textarea id="list-input" class="filter" rows="8" placeholder="1- Skank - Resposta&#10;2- Oasis - Wonderwall&#10;3- Djavan - Se"></textarea>
+      <div class="row wrap">
+        <button id="list-run" class="btn btn-primary">Buscar todas</button>
+        <button id="list-clear" class="btn">Limpar</button>
+      </div>
+      <p id="list-summary" class="small" aria-live="polite"></p>
+      <div id="list-actions" class="row wrap" hidden>
+        <button id="list-play" class="btn btn-primary">▶ Tocar tudo</button>
+        <a id="list-yt" class="btn" target="_blank" rel="noopener">Abrir no YouTube</a>
+        <button id="list-save" class="btn">Salvar playlist</button>
+      </div>
+      <ul id="list-results" class="list"></ul>
     </section>
 
     <!-- Reproduzir -->
@@ -56,6 +84,11 @@
           <input id="import" type="file" accept="audio/*" multiple hidden>
         </label>
       </header>
+      <div id="playlists-box" hidden>
+        <h3 class="section-title">Playlists</h3>
+        <ul id="playlists" class="list"></ul>
+        <h3 class="section-title">Músicas</h3>
+      </div>
       <input id="lib-filter" class="filter" type="search" placeholder="Filtrar biblioteca" aria-label="Filtrar biblioteca">
       <ul id="library" class="list"></ul>
       <div id="lib-empty" class="empty" hidden>
@@ -67,6 +100,22 @@
     <!-- Configurações -->
     <section id="view-settings" class="view" aria-label="Configurações">
       <header class="view-head"><h2>Configurações</h2></header>
+
+      <div class="card">
+        <h3>YouTube</h3>
+        <p class="small">Para buscar e tocar vídeos do YouTube no app, cole uma <b>chave de API</b> grátis do Google:</p>
+        <ol class="small steps">
+          <li>Abra <a href="https://console.cloud.google.com/apis/library/youtube.googleapis.com" target="_blank" rel="noopener">YouTube Data API v3</a> e crie um projeto</li>
+          <li>Toque em <b>Ativar</b></li>
+          <li>Vá em <b>Credenciais → Criar credenciais → Chave de API</b></li>
+          <li>Recomendado: restrinja a chave ao site <b>gilsonbolivar-maker.github.io/*</b></li>
+        </ol>
+        <form id="youtube-form" class="row">
+          <input id="youtube-key" class="filter" placeholder="Chave de API" autocomplete="off">
+          <button class="btn btn-primary">Salvar</button>
+        </form>
+        <p class="small">A cota grátis permite cerca de <b>100 buscas por dia</b>. O YouTube só toca com o app aberto; não é possível baixar.</p>
+      </div>
 
       <div class="card">
         <h3>Jamendo</h3>
@@ -124,6 +173,7 @@
       <svg class="ico" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg>
     </button>
     <img id="full-cover" class="full-cover" alt="">
+    <div class="full-video-space" aria-hidden="true"></div>
     <h2 id="full-title"></h2>
     <p id="full-artist" class="muted"></p>
     <input id="seek" type="range" min="0" max="1000" value="0" aria-label="Posição">
@@ -146,6 +196,9 @@
     </div>
     <a id="full-license" class="small" target="_blank" rel="noopener" hidden>Ver licença</a>
   </div>
+
+  <!-- Player do YouTube: fica sempre visível enquanto toca, como exigem as regras do YouTube -->
+  <div id="yt-host" class="yt-host"><div id="yt-player"></div></div>
 
   <nav class="bottomnav">
     <button class="nav active" data-view="search">

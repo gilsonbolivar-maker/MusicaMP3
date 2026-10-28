@@ -10,6 +10,7 @@ const ICONS = {
   check: '<svg class="ico" viewBox="0 0 24 24"><path d="m5 12 5 5L20 7"/></svg>',
   list: '<svg class="ico" viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>',
   trash: '<svg class="ico" viewBox="0 0 24 24"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg>',
+  external: '<svg class="ico" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></svg>',
 };
 const NO_COVER = 'data:image/svg+xml,' + encodeURIComponent(
   '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48"><rect width="48" height="48" fill="#f6c945"/>' +
@@ -27,10 +28,14 @@ const parseLength = (v) => {
   if (String(v).includes(':')) return String(v).split(':').reduce((a, n) => a * 60 + Number(n), 0);
   return Number(v) || 0;
 };
+// A API do YouTube devolve títulos com entidades HTML (&amp;, &#39;…).
+const decodeHtml = (s) => { const t = document.createElement('textarea'); t.innerHTML = s ?? ''; return t.value; };
+const ytWatchUrl = (id) => `https://www.youtube.com/watch?v=${encodeURIComponent(id)}`;
+const ytSearchUrl = (q) => `https://www.youtube.com/results?search_query=${encodeURIComponent(q)}`;
 
 /* ---------- Configurações ---------- */
 const settings = (() => {
-  const defaults = { jamendoId: '', theme: 'auto' };
+  const defaults = { jamendoId: '', youtubeKey: '', theme: 'auto' };
   try { return { ...defaults, ...JSON.parse(localStorage.getItem('mmp3-settings') || '{}') }; }
   catch { return defaults; }
 })();
@@ -52,32 +57,38 @@ function toast(msg) {
   toastTimer = setTimeout(() => (el.hidden = true), 3000);
 }
 
-/* ---------- IndexedDB (biblioteca offline) ---------- */
+/* ---------- IndexedDB (biblioteca offline e playlists) ---------- */
 const DB = (() => {
   let opening;
   const open = () => opening ||= new Promise((resolve, reject) => {
-    const req = indexedDB.open('musicamp3', 1);
-    req.onupgradeneeded = () => req.result.createObjectStore('tracks', { keyPath: 'id' });
+    const req = indexedDB.open('musicamp3', 2);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains('tracks')) db.createObjectStore('tracks', { keyPath: 'id' });
+      if (!db.objectStoreNames.contains('playlists')) db.createObjectStore('playlists', { keyPath: 'id' });
+    };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
-  const run = async (mode, fn) => {
+  const run = async (store, mode, fn) => {
     const db = await open();
     return new Promise((resolve, reject) => {
-      const tx = db.transaction('tracks', mode);
-      const req = fn(tx.objectStore('tracks'));
+      const tx = db.transaction(store, mode);
+      const req = fn(tx.objectStore(store));
       tx.oncomplete = () => resolve(req.result);
       tx.onerror = () => reject(tx.error);
       tx.onabort = () => reject(tx.error);
     });
   };
-  return {
-    all: () => run('readonly', (s) => s.getAll()),
-    keys: () => run('readonly', (s) => s.getAllKeys()),
-    put: (v) => run('readwrite', (s) => s.put(v)),
-    del: (id) => run('readwrite', (s) => s.delete(id)),
-    clear: () => run('readwrite', (s) => s.clear()),
-  };
+  const storeApi = (store) => ({
+    all: () => run(store, 'readonly', (s) => s.getAll()),
+    keys: () => run(store, 'readonly', (s) => s.getAllKeys()),
+    get: (id) => run(store, 'readonly', (s) => s.get(id)),
+    put: (v) => run(store, 'readwrite', (s) => s.put(v)),
+    del: (id) => run(store, 'readwrite', (s) => s.delete(id)),
+    clear: () => run(store, 'readwrite', (s) => s.clear()),
+  });
+  return { ...storeApi('tracks'), playlists: storeApi('playlists') };
 })();
 let savedIds = new Set();
 DB.keys().then((k) => { savedIds = new Set(k); }).catch(() => {});
@@ -93,8 +104,8 @@ async function searchArchive(q, page = 1) {
   const res = await fetch(`https://archive.org/advancedsearch.php?${params}`);
   if (!res.ok) throw new Error(`Archive: HTTP ${res.status}`);
   const data = await res.json();
+  const shown = page * 20;
   return {
-    total: data.response.numFound,
     items: data.response.docs.map((d) => ({
       kind: 'album',
       source: 'archive',
@@ -104,6 +115,7 @@ async function searchArchive(q, page = 1) {
       cover: `https://archive.org/services/img/${encodeURIComponent(d.identifier)}`,
       license: d.licenseurl || `https://archive.org/details/${d.identifier}`,
     })),
+    more: shown < data.response.numFound ? () => searchArchive(q, page + 1) : null,
   };
 }
 
@@ -142,8 +154,8 @@ async function searchJamendo(q, page = 1) {
   if (!res.ok) throw new Error(`Jamendo: HTTP ${res.status}`);
   const data = await res.json();
   if (data.headers?.status !== 'success') throw new Error(`Jamendo: ${data.headers?.error_message || 'erro'}`);
+  const total = data.headers.results_fullcount ?? data.results.length;
   return {
-    total: data.headers.results_fullcount ?? data.results.length,
     items: data.results.map((t) => ({
       kind: 'track',
       id: `jm:${t.id}`,
@@ -157,13 +169,42 @@ async function searchJamendo(q, page = 1) {
       duration: t.duration,
       license: t.license_ccurl,
     })),
+    more: page * 20 < total ? () => searchJamendo(q, page + 1) : null,
+  };
+}
+
+async function searchYouTube(q, { pageToken = '', max = 20 } = {}) {
+  if (!settings.youtubeKey) return { needsKey: true, items: [] };
+  const params = new URLSearchParams({
+    part: 'snippet', type: 'video', videoEmbeddable: 'true', maxResults: String(max),
+    q, key: settings.youtubeKey, regionCode: 'BR',
+  });
+  if (pageToken) params.set('pageToken', pageToken);
+  const res = await fetch(`https://www.googleapis.com/youtube/v3/search?${params}`);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const reason = data.error?.errors?.[0]?.reason;
+    if (reason === 'quotaExceeded') throw new Error('YouTube: cota diária esgotada, tente amanhã');
+    throw new Error(`YouTube: ${data.error?.message || `HTTP ${res.status}`}`);
+  }
+  return {
+    items: (data.items || []).map((it) => ({
+      kind: 'track',
+      id: `yt:${it.id.videoId}`,
+      source: 'youtube',
+      youtube: it.id.videoId,
+      title: decodeHtml(it.snippet.title),
+      artist: decodeHtml(it.snippet.channelTitle),
+      cover: it.snippet.thumbnails?.medium?.url || it.snippet.thumbnails?.default?.url || '',
+      license: ytWatchUrl(it.id.videoId),
+    })),
+    more: data.nextPageToken ? () => searchYouTube(q, { pageToken: data.nextPageToken, max }) : null,
   };
 }
 
 /* ---------- Busca ---------- */
 let source = 'all';
 let lastQuery = '';
-let pages = { archive: 1, jamendo: 1 };
 
 $$('.tab').forEach((tab) => tab.addEventListener('click', () => {
   $$('.tab').forEach((t) => t.classList.toggle('active', t === tab));
@@ -181,28 +222,33 @@ $('#search-form').addEventListener('submit', (e) => {
 
 async function runSearch(q) {
   lastQuery = q;
-  pages = { archive: 1, jamendo: 1 };
   document.body.classList.add('has-results');
   const box = $('#results');
   box.innerHTML = '<p class="status">Buscando…</p>';
-  const wantJm = source !== 'archive';
-  const wantIa = source !== 'jamendo';
-  const [jm, ia] = await Promise.allSettled([
-    wantJm ? searchJamendo(q) : null,
-    wantIa ? searchArchive(q) : null,
+  const want = (s) => source === 'all' || source === s;
+  const [yt, jm, ia] = await Promise.allSettled([
+    want('youtube') ? searchYouTube(q) : null,
+    want('jamendo') ? searchJamendo(q) : null,
+    want('archive') ? searchArchive(q) : null,
   ]);
   if (q !== lastQuery) return; // busca mais nova já começou
   box.innerHTML = '';
 
-  if (wantJm) {
+  if (want('youtube')) {
+    if (yt.status === 'rejected') box.append(notice(yt.reason.message));
+    else if (yt.value.needsKey) {
+      box.append(notice(`Para tocar o YouTube aqui, adicione a <b>chave de API</b> em <b>Configurações</b>. Ou <a href="${esc(ytSearchUrl(q))}" target="_blank" rel="noopener">abra a busca no YouTube ↗</a>`, true));
+    } else renderSection(box, 'YouTube', yt.value);
+  }
+  if (want('jamendo')) {
     if (jm.status === 'rejected') box.append(notice(`Falha no Jamendo: ${jm.reason.message}`));
     else if (jm.value.needsKey) {
       if (source === 'jamendo') box.append(notice('Para buscar no Jamendo, adicione seu <b>Client ID</b> em <b>Configurações</b>.', true));
-    } else renderSection(box, 'Jamendo', jm.value, 'jamendo');
+    } else renderSection(box, 'Jamendo', jm.value);
   }
-  if (wantIa) {
+  if (want('archive')) {
     if (ia.status === 'rejected') box.append(notice(`Falha no Internet Archive: ${ia.reason.message}`));
-    else renderSection(box, 'Internet Archive', ia.value, 'archive');
+    else renderSection(box, 'Internet Archive', ia.value);
   }
   if (!box.children.length) box.innerHTML = '<p class="status">Nenhum resultado.</p>';
 }
@@ -214,43 +260,44 @@ function notice(html, isHtml) {
   return div;
 }
 
-function renderSection(box, title, result, src) {
+function renderSection(box, title, result) {
   const sec = document.createElement('section');
   sec.innerHTML = `<h3 class="section-title">${esc(title)}</h3><ul class="list"></ul>`;
   const list = $('ul', sec);
-  appendItems(list, result.items);
+  const queue = [];
+  appendItems(list, result.items, queue);
   if (!result.items.length) list.innerHTML = '<li class="status">Nenhum resultado.</li>';
-  addMoreButton(sec, list, result, src);
+  addMoreButton(sec, list, result.more, queue);
   box.append(sec);
 }
 
-function addMoreButton(sec, list, result, src) {
-  if (list.children.length >= result.total) return;
-  const more = document.createElement('button');
-  more.className = 'btn more-btn';
-  more.textContent = 'Carregar mais';
-  more.onclick = async () => {
-    more.disabled = true;
-    more.textContent = 'Carregando…';
+function addMoreButton(sec, list, more, queue) {
+  if (!more) return;
+  const btn = document.createElement('button');
+  btn.className = 'btn more-btn';
+  btn.textContent = 'Carregar mais';
+  btn.onclick = async () => {
+    btn.disabled = true;
+    btn.textContent = 'Carregando…';
     try {
-      pages[src] += 1;
-      const next = await (src === 'archive' ? searchArchive : searchJamendo)(lastQuery, pages[src]);
-      appendItems(list, next.items);
-      more.remove();
-      if (next.items.length) addMoreButton(sec, list, result, src);
+      const next = await more();
+      appendItems(list, next.items, queue);
+      btn.remove();
+      if (next.items.length) addMoreButton(sec, list, next.more, queue);
     } catch (err) {
       toast(err.message);
-      more.disabled = false;
-      more.textContent = 'Carregar mais';
+      btn.disabled = false;
+      btn.textContent = 'Carregar mais';
     }
   };
-  sec.append(more);
+  sec.append(btn);
 }
 
-function appendItems(list, items) {
-  const tracks = items.filter((i) => i.kind === 'track');
+// `queue` é compartilhada pela seção, para "Carregar mais" continuar a mesma fila.
+function appendItems(list, items, queue) {
   for (const item of items) {
-    list.append(item.kind === 'album' ? albumRow(item) : trackRow(item, tracks));
+    if (item.kind === 'album') list.append(albumRow(item));
+    else { queue.push(item); list.append(trackRow(item, queue)); }
   }
 }
 
@@ -269,16 +316,22 @@ function trackRow(track, queue) {
   li.className = 'item';
   li.dataset.id = track.id;
   const dur = track.duration ? ` · ${fmt(track.duration)}` : '';
+  const action = track.youtube
+    ? `<a class="icon-btn" href="${esc(ytWatchUrl(track.youtube))}" target="_blank" rel="noopener" aria-label="Abrir no YouTube">${ICONS.external}</a>`
+    : `<button class="icon-btn dl" aria-label="Baixar">${savedIds.has(track.id) ? ICONS.check : ICONS.download}</button>`;
   li.innerHTML = `
-    <button class="meta"><b>${esc(track.title)}</b><small>${esc(track.artist)}${dur}</small></button>
+    <button class="meta"><b>${esc(track.title)}</b><small>${track.youtube ? '<span class="badge">youtube</span>' : ''}${esc(track.artist)}${dur}</small></button>
     <button class="icon-btn play" aria-label="Tocar">${ICONS.play}</button>
-    <button class="icon-btn dl" aria-label="Baixar">${savedIds.has(track.id) ? ICONS.check : ICONS.download}</button>`;
+    ${action}`;
   li.prepend(coverImg(track.cover));
-  if (savedIds.has(track.id)) $('.dl', li).classList.add('done');
   const play = () => Player.play(queue, queue.indexOf(track));
   $('.meta', li).onclick = play;
   $('.play', li).onclick = play;
-  $('.dl', li).onclick = (e) => downloadTrack(track, e.currentTarget);
+  const dl = $('.dl', li);
+  if (dl) {
+    if (savedIds.has(track.id)) dl.classList.add('done');
+    dl.onclick = (e) => downloadTrack(track, e.currentTarget);
+  }
   if (Player.current?.id === track.id) li.classList.add('playing');
   return li;
 }
@@ -383,11 +436,17 @@ async function downloadTrack(track, btn) {
 /* ---------- Biblioteca ---------- */
 let library = [];
 
-async function renderLibrary() {
+async function loadLibrary() {
   try { library = await DB.all(); }
   catch { library = []; toast('Armazenamento indisponível neste navegador'); }
   library.sort((a, b) => b.addedAt - a.addedAt);
   savedIds = new Set(library.map((t) => t.id));
+  return library;
+}
+
+async function renderLibrary() {
+  await loadLibrary();
+  renderPlaylists();
   const term = $('#lib-filter').value.trim().toLowerCase();
   const shown = term ? library.filter((t) => `${t.title} ${t.artist}`.toLowerCase().includes(term)) : library;
   const list = $('#library');
@@ -397,9 +456,8 @@ async function renderLibrary() {
     const li = document.createElement('li');
     li.className = 'item';
     li.dataset.id = t.id;
-    const label = { archive: 'archive', jamendo: 'jamendo', local: 'local' }[t.source] || t.source;
     li.innerHTML = `
-      <button class="meta"><b>${esc(t.title)}</b><small><span class="badge">${esc(label)}</span>${esc(t.artist)}</small></button>
+      <button class="meta"><b>${esc(t.title)}</b><small><span class="badge">${esc(t.source)}</span>${esc(t.artist)}</small></button>
       <button class="icon-btn del" aria-label="Apagar">${ICONS.trash}</button>`;
     const img = coverImg(null);
     if (t.coverBlob) {
@@ -437,39 +495,312 @@ $('#import').addEventListener('change', async (e) => {
   renderLibrary();
 });
 
+/* ---------- Lista de músicas ---------- */
+const norm = (s) => String(s ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '')
+  .toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+const tokens = (s) => norm(s).split(' ').filter(Boolean);
+
+// "12- Capital inicial - Não olhe pra trás." → { artist: "Capital inicial", title: "Não olhe pra trás" }
+function parseLine(line) {
+  const s = line.replace(/^\s*\d+\s*[-.)º°]+\s*/, '').replace(/[\s.;,]+$/, '').trim();
+  const m = s.match(/^(.+?)\s*[-–—]\s*(.+)$/);
+  return m ? { line: s, artist: m[1].trim(), title: m[2].trim() } : { line: s, artist: '', title: s };
+}
+
+// Procura a música entre os arquivos baixados/importados, tolerando acentos e pontuação.
+function findInLibrary(entry) {
+  const wantTitle = tokens(entry.title);
+  const wantArtist = tokens(entry.artist);
+  if (!wantTitle.length) return null;
+  const coverage = (want, have) => want.filter((w) => have.has(w)).length / want.length;
+  let best = null;
+  let bestScore = 0;
+  for (const t of library) {
+    const have = new Set(tokens(`${t.title} ${t.artist}`));
+    const tc = coverage(wantTitle, have);
+    const ac = wantArtist.length ? coverage(wantArtist, have) : 1;
+    const ok = (tc >= 0.75 && ac >= 0.5) || (tc === 1 && wantTitle.length >= 2);
+    const score = tc * 2 + ac;
+    if (ok && score > bestScore) { best = t; bestScore = score; }
+  }
+  return best;
+}
+
+// Cache das buscas no YouTube, para economizar a cota diária.
+const ytCache = (() => {
+  let map = {};
+  try { map = JSON.parse(localStorage.getItem('mmp3-ytcache') || '{}'); } catch { /* sem cache */ }
+  return {
+    get: (q) => map[q],
+    set(q, v) {
+      map[q] = v;
+      const keys = Object.keys(map);
+      if (keys.length > 500) delete map[keys[0]];
+      try { localStorage.setItem('mmp3-ytcache', JSON.stringify(map)); } catch { /* cheio */ }
+    },
+  };
+})();
+
+let listEntries = [];
+
+async function resolveEntry(entry) {
+  const local = findInLibrary(entry);
+  if (local) return { ...entry, match: local };
+  if (!settings.youtubeKey) return { ...entry, match: null };
+  const q = `${entry.artist} ${entry.title}`.trim();
+  let hit = ytCache.get(norm(q));
+  if (hit === undefined) {
+    const res = await searchYouTube(q, { max: 1 });
+    hit = res.items[0] || null;
+    ytCache.set(norm(q), hit);
+  }
+  return { ...entry, match: hit };
+}
+
+async function runList() {
+  const lines = $('#list-input').value.split('\n').map((l) => l.trim()).filter(Boolean);
+  if (!lines.length) { toast('Cole pelo menos uma música'); return; }
+  const btn = $('#list-run');
+  btn.disabled = true;
+  await loadLibrary();
+  listEntries = lines.map(parseLine);
+  $('#list-summary').textContent = `Procurando… 0/${listEntries.length}`;
+  renderListResults();
+  let done = 0;
+  let failure = null;
+  // 4 buscas por vez, atualizando a tela conforme chegam.
+  const queue = listEntries.map((_, i) => i);
+  const worker = async () => {
+    while (queue.length && !failure) {
+      const i = queue.shift();
+      try { listEntries[i] = await resolveEntry(listEntries[i]); }
+      catch (err) { failure = err; listEntries[i] = { ...listEntries[i], match: null }; }
+      listEntries[i].checked = true;
+      done++;
+      $('#list-summary').textContent = `Procurando… ${done}/${listEntries.length}`;
+      renderListResults();
+    }
+  };
+  await Promise.all(Array.from({ length: 4 }, worker));
+  btn.disabled = false;
+  if (failure) toast(failure.message);
+  renderListResults();
+}
+
+function listQueue() {
+  return listEntries.map((e) => e.match).filter(Boolean);
+}
+
+function renderListResults() {
+  const ul = $('#list-results');
+  ul.innerHTML = '';
+  const queue = listQueue();
+  listEntries.forEach((e, i) => {
+    const li = document.createElement('li');
+    li.className = 'item';
+    const q = `${e.artist} ${e.title}`.trim();
+    let status;
+    if (!e.checked && !e.match) status = '<small>procurando…</small>';
+    else if (!e.match) status = '<small class="missing">não encontrada</small>';
+    else if (e.match.youtube) status = `<small class="found">YouTube: ${esc(e.match.title)}</small>`;
+    else status = '<small class="found">na sua biblioteca</small>';
+    li.innerHTML = `
+      <span class="num">${i + 1}</span>
+      <div class="meta"><b>${esc(e.line)}</b>${status}</div>
+      ${e.match ? `<button class="icon-btn play" aria-label="Tocar">${ICONS.play}</button>` : ''}
+      <a class="icon-btn" href="${esc(ytSearchUrl(q))}" target="_blank" rel="noopener" aria-label="Buscar no YouTube">${ICONS.external}</a>`;
+    if (e.match) {
+      li.dataset.id = e.match.id;
+      $('.play', li).onclick = () => Player.play(queue, queue.indexOf(e.match));
+      if (Player.current?.id === e.match.id) li.classList.add('playing');
+    }
+    ul.append(li);
+  });
+
+  const checked = listEntries.filter((e) => e.checked || e.match).length;
+  if (checked === listEntries.length && listEntries.length) {
+    const found = queue.length;
+    let txt = `${found} de ${listEntries.length} encontradas.`;
+    if (!settings.youtubeKey && found < listEntries.length) txt += ' Adicione a chave do YouTube em Configurações para achar as outras automaticamente.';
+    $('#list-summary').textContent = txt;
+  }
+  const ytIds = queue.filter((t) => t.youtube).map((t) => t.youtube).slice(0, 50);
+  $('#list-actions').hidden = !queue.length;
+  $('#list-yt').hidden = !ytIds.length;
+  $('#list-yt').href = `https://www.youtube.com/watch_videos?video_ids=${ytIds.join(',')}`;
+}
+
+$('#open-list').onclick = () => showView('list');
+$('#list-back').onclick = () => showView('search');
+$('#list-run').onclick = runList;
+$('#list-clear').onclick = () => {
+  $('#list-input').value = '';
+  listEntries = [];
+  $('#list-summary').textContent = '';
+  renderListResults();
+};
+$('#list-play').onclick = () => {
+  const queue = listQueue();
+  if (queue.length) Player.play(queue, 0);
+};
+$('#list-save').onclick = async () => {
+  const name = prompt('Nome da playlist:', 'Minha lista');
+  if (!name) return;
+  // Músicas da biblioteca são salvas só pelo id (o arquivo já está guardado).
+  const items = listEntries.map((e) => ({
+    line: e.line, artist: e.artist, title: e.title,
+    match: !e.match ? null : e.match.youtube
+      ? { id: e.match.id, source: 'youtube', youtube: e.match.youtube, title: e.match.title, artist: e.match.artist, cover: e.match.cover, license: e.match.license }
+      : { id: e.match.id, source: 'library' },
+  }));
+  await DB.playlists.put({ id: `pl:${Date.now()}`, name: name.trim(), items, createdAt: Date.now() });
+  toast('Playlist salva em Reproduzir');
+};
+
+/* ---------- Playlists ---------- */
+async function playlistEntries(pl) {
+  await loadLibrary();
+  const byId = new Map(library.map((t) => [t.id, t]));
+  return pl.items.map((it) => ({
+    line: it.line, artist: it.artist, title: it.title, checked: true,
+    match: !it.match ? null : it.match.source === 'library' ? byId.get(it.match.id) || null : it.match,
+  }));
+}
+
+async function renderPlaylists() {
+  let pls = [];
+  try { pls = await DB.playlists.all(); } catch { /* sem armazenamento */ }
+  pls.sort((a, b) => b.createdAt - a.createdAt);
+  $('#playlists-box').hidden = !pls.length;
+  const ul = $('#playlists');
+  ul.innerHTML = '';
+  for (const pl of pls) {
+    const li = document.createElement('li');
+    li.className = 'item';
+    const found = pl.items.filter((i) => i.match).length;
+    li.innerHTML = `
+      <button class="meta"><b>${esc(pl.name)}</b><small>${found} de ${pl.items.length} músicas</small></button>
+      <button class="icon-btn play" aria-label="Tocar playlist">${ICONS.play}</button>
+      <button class="icon-btn del" aria-label="Apagar playlist">${ICONS.trash}</button>`;
+    li.prepend(coverImg(null));
+    $('.meta', li).onclick = async () => {
+      listEntries = await playlistEntries(pl);
+      $('#list-input').value = pl.items.map((i) => i.line).join('\n');
+      showView('list');
+      renderListResults();
+    };
+    $('.play', li).onclick = async () => {
+      const queue = (await playlistEntries(pl)).map((e) => e.match).filter(Boolean);
+      if (queue.length) Player.play(queue, 0); else toast('Nenhuma música encontrada nesta playlist');
+    };
+    $('.del', li).onclick = async () => {
+      if (!confirm(`Apagar a playlist "${pl.name}"?`)) return;
+      await DB.playlists.del(pl.id);
+      renderPlaylists();
+    };
+    ul.append(li);
+  }
+}
+
+/* ---------- YouTube (player oficial embutido) ---------- */
+const yt = { api: null, creating: null, player: null, errors: 0 };
+
+function loadYouTubeApi() {
+  return yt.api ||= new Promise((resolve, reject) => {
+    window.onYouTubeIframeAPIReady = () => resolve(window.YT);
+    const s = document.createElement('script');
+    s.src = 'https://www.youtube.com/iframe_api';
+    s.onerror = () => { yt.api = null; reject(new Error('Não foi possível carregar o YouTube')); };
+    document.head.append(s);
+  });
+}
+
+async function ytPlay(videoId) {
+  const YT = await loadYouTubeApi();
+  yt.creating ||= new Promise((resolve) => {
+    const p = new YT.Player('yt-player', {
+      width: '100%', height: '100%',
+      playerVars: { playsinline: 1, rel: 0 },
+      events: {
+        onReady: () => { yt.player = p; resolve(p); },
+        onStateChange: onYtState,
+        onError: onYtError,
+      },
+    });
+  });
+  const p = await yt.creating;
+  if (Player.current?.youtube === videoId) p.loadVideoById(videoId);
+}
+
+function onYtState(e) {
+  if (e.data === 1) yt.errors = 0;
+  if (e.data === 0 && Player.isYt) Player.next(true);
+  Player.renderState();
+}
+
+function onYtError() {
+  // 101/150: o dono do vídeo não permite tocar fora do YouTube.
+  yt.errors++;
+  if (yt.errors > Player.queue.length) { toast('Nenhum vídeo da fila pode tocar aqui'); return; }
+  toast('Este vídeo não pode tocar fora do YouTube. Pulando…');
+  setTimeout(() => Player.next(true), 1200);
+}
+
 /* ---------- Player ---------- */
 const audio = $('#audio');
 const Player = {
   queue: [], index: -1, shuffle: false, repeat: 'off', // off | all | one
   srcUrl: null, coverUrl: null,
   get current() { return this.queue[this.index] || null; },
+  get isYt() { return !!this.current?.youtube; },
+
+  get paused() {
+    if (!this.isYt) return audio.paused;
+    const state = yt.player?.getPlayerState?.();
+    return state !== 1 && state !== 3; // 1 = tocando, 3 = carregando
+  },
+  get time() { return this.isYt ? yt.player?.getCurrentTime?.() || 0 : audio.currentTime; },
+  get duration() { return this.isYt ? yt.player?.getDuration?.() || 0 : audio.duration; },
+  seek(sec) { if (this.isYt) yt.player?.seekTo?.(sec, true); else audio.currentTime = sec; },
+  resume() { if (this.isYt) yt.player?.playVideo?.(); else audio.play().catch(() => {}); },
+  pause() { if (this.isYt) yt.player?.pauseVideo?.(); else audio.pause(); },
 
   play(queue, index) {
     this.queue = queue.slice();
     this.index = index;
-    this.load(true);
+    yt.errors = 0;
+    this.load();
   },
 
-  load(autoplay) {
+  load() {
     const t = this.current;
     if (!t) return;
     if (this.srcUrl) URL.revokeObjectURL(this.srcUrl);
     if (this.coverUrl) URL.revokeObjectURL(this.coverUrl);
-    this.srcUrl = t.blob ? URL.createObjectURL(t.blob) : null;
+    this.srcUrl = null;
     this.coverUrl = t.coverBlob ? URL.createObjectURL(t.coverBlob) : null;
-    audio.src = this.srcUrl || t.src;
-    if (autoplay) audio.play().catch(() => {});
+    if (t.youtube) {
+      audio.pause();
+      document.body.classList.add('yt-active');
+      ytPlay(t.youtube).catch((err) => toast(err.message));
+    } else {
+      yt.player?.stopVideo?.();
+      document.body.classList.remove('yt-active');
+      this.srcUrl = t.blob ? URL.createObjectURL(t.blob) : null;
+      audio.src = this.srcUrl || t.src;
+      audio.play().catch(() => {});
+    }
     this.render();
   },
 
   toggle() {
     if (!this.current) return;
-    if (audio.paused) audio.play().catch(() => {}); else audio.pause();
+    if (this.paused) this.resume(); else this.pause();
   },
 
   next(auto = false) {
     if (!this.queue.length) return;
-    if (auto && this.repeat === 'one') { audio.currentTime = 0; audio.play(); return; }
+    if (auto && this.repeat === 'one') { this.seek(0); this.resume(); return; }
     if (this.shuffle && this.queue.length > 1) {
       let i;
       do i = Math.floor(Math.random() * this.queue.length); while (i === this.index);
@@ -477,13 +808,13 @@ const Player = {
     } else if (this.index < this.queue.length - 1) this.index++;
     else if (this.repeat === 'all' || !auto) this.index = 0;
     else return;
-    this.load(true);
+    this.load();
   },
 
   prev() {
-    if (audio.currentTime > 3 || this.index <= 0) { audio.currentTime = 0; return; }
+    if (this.time > 3 || this.index <= 0) { this.seek(0); return; }
     this.index--;
-    this.load(true);
+    this.load();
   },
 
   render() {
@@ -500,7 +831,10 @@ const Player = {
     $('#mini-artist').textContent = $('#full-artist').textContent = t.artist;
     const lic = $('#full-license');
     lic.hidden = !t.license;
-    if (t.license) lic.href = t.license;
+    if (t.license) {
+      lic.href = t.license;
+      lic.textContent = t.youtube ? 'Abrir no YouTube' : 'Ver licença';
+    }
     $$('.item[data-id]').forEach((el) => el.classList.toggle('playing', el.dataset.id === t.id));
     if ('mediaSession' in navigator) {
       navigator.mediaSession.metadata = new MediaMetadata({
@@ -512,7 +846,7 @@ const Player = {
   },
 
   renderState() {
-    const icon = audio.paused ? ICONS.play : ICONS.pause;
+    const icon = this.paused ? ICONS.play : ICONS.pause;
     $('#mini-play').innerHTML = icon;
     $('#btn-play').innerHTML = icon;
     $('#btn-shuffle').classList.toggle('on', this.shuffle);
@@ -521,26 +855,33 @@ const Player = {
   },
 };
 
+let seeking = false;
+function updateProgress() {
+  const d = Player.duration;
+  const cur = Player.time;
+  const pct = d ? cur / d : 0;
+  $('#mini-bar').style.width = `${pct * 100}%`;
+  if (!seeking) {
+    $('#seek').value = Math.round(pct * 1000);
+    $('#t-cur').textContent = fmt(cur);
+  }
+  $('#t-dur').textContent = fmt(d);
+}
+// O player do YouTube não emite eventos de tempo; consultamos a cada meio segundo.
+setInterval(() => { if (Player.isYt && yt.player) updateProgress(); }, 500);
+
 audio.addEventListener('play', () => Player.renderState());
 audio.addEventListener('pause', () => Player.renderState());
-audio.addEventListener('ended', () => Player.next(true));
+audio.addEventListener('ended', () => { if (!Player.isYt) Player.next(true); });
 audio.addEventListener('error', () => {
-  if (!Player.current) return;
+  if (!Player.current || Player.isYt) return;
   toast('Não foi possível tocar esta faixa');
 });
-audio.addEventListener('timeupdate', () => {
-  const d = audio.duration;
-  const pct = d ? audio.currentTime / d : 0;
-  $('#mini-bar').style.width = `${pct * 100}%`;
-  if (!seeking) $('#seek').value = Math.round(pct * 1000);
-  $('#t-cur').textContent = fmt(audio.currentTime);
-  $('#t-dur').textContent = fmt(d);
-});
+audio.addEventListener('timeupdate', () => { if (!Player.isYt) updateProgress(); });
 
-let seeking = false;
-$('#seek').addEventListener('input', () => { seeking = true; $('#t-cur').textContent = fmt((($('#seek').value) / 1000) * audio.duration); });
+$('#seek').addEventListener('input', () => { seeking = true; $('#t-cur').textContent = fmt(($('#seek').value / 1000) * Player.duration); });
 $('#seek').addEventListener('change', () => {
-  if (audio.duration) audio.currentTime = ($('#seek').value / 1000) * audio.duration;
+  if (Player.duration) Player.seek(($('#seek').value / 1000) * Player.duration);
   seeking = false;
 });
 
@@ -554,22 +895,23 @@ $('#btn-repeat').onclick = () => {
   Player.repeat = { off: 'all', all: 'one', one: 'off' }[Player.repeat];
   Player.renderState();
 };
-$('#mini-open').onclick = () => { $('#full').hidden = false; };
-$('#full-close').onclick = () => { $('#full').hidden = true; };
+$('#mini-open').onclick = () => { $('#full').hidden = false; document.body.classList.add('full-open'); };
+$('#full-close').onclick = () => { $('#full').hidden = true; document.body.classList.remove('full-open'); };
 
 if ('mediaSession' in navigator) {
   const ms = navigator.mediaSession;
-  ms.setActionHandler('play', () => audio.play());
-  ms.setActionHandler('pause', () => audio.pause());
+  ms.setActionHandler('play', () => Player.resume());
+  ms.setActionHandler('pause', () => Player.pause());
   ms.setActionHandler('previoustrack', () => Player.prev());
   ms.setActionHandler('nexttrack', () => Player.next());
-  try { ms.setActionHandler('seekto', (d) => { audio.currentTime = d.seekTime; }); } catch { /* sem suporte */ }
+  try { ms.setActionHandler('seekto', (d) => Player.seek(d.seekTime)); } catch { /* sem suporte */ }
 }
 
 /* ---------- Navegação ---------- */
 function showView(name) {
   $$('.view').forEach((v) => v.classList.toggle('active', v.id === `view-${name}`));
-  $$('.nav').forEach((n) => n.classList.toggle('active', n.dataset.view === name));
+  const tab = name === 'list' ? 'search' : name;
+  $$('.nav').forEach((n) => n.classList.toggle('active', n.dataset.view === tab));
   if (name === 'library') renderLibrary();
   if (name === 'settings') renderSettings();
   window.scrollTo(0, 0);
@@ -579,6 +921,7 @@ $$('.nav').forEach((n) => n.addEventListener('click', () => showView(n.dataset.v
 /* ---------- Tela de configurações ---------- */
 async function renderSettings() {
   $('#jamendo-id').value = settings.jamendoId;
+  $('#youtube-key').value = settings.youtubeKey;
   $('#theme').value = settings.theme;
   const info = $('#storage-info');
   try {
@@ -596,6 +939,12 @@ $('#jamendo-form').addEventListener('submit', (e) => {
   settings.jamendoId = $('#jamendo-id').value.trim();
   saveSettings();
   toast(settings.jamendoId ? 'Client ID salvo' : 'Client ID removido');
+});
+$('#youtube-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  settings.youtubeKey = $('#youtube-key').value.trim();
+  saveSettings();
+  toast(settings.youtubeKey ? 'Chave do YouTube salva' : 'Chave do YouTube removida');
 });
 $('#theme').addEventListener('change', (e) => {
   settings.theme = e.target.value;
